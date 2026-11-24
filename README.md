@@ -1,11 +1,13 @@
-
-# Gemini API Proxy, Key Rotator & Model Fallback для VS Code (Cline)
+# Gemini API Proxy, Smart Key Rotator & Auto Model Fallback для VS Code (Cline)
 
 Локальный прокси-ротатор на Python (без сторонних библиотек), который:
 1. Направляет запросы к `generativelanguage.googleapis.com` через внешний HTTP-прокси (`100.64.0.101:8888`).
-2. Автоматически перебирает API-ключи из `keys.txt` при ошибке лимита (`429`).
-3. Автоматически переключается на резервные модели из списка `MODELS` при перегрузке (`500`, `502`, `503`, `504`) или сетевом сбое, а при `404` исключает недоступную модель для текущего запроса.
-4. Повторяет попытки по кругу с нарастающей паузой (`3с → 6с → 9с`) до `120` секунд (`MAX_WAIT`), чтобы не приходилось постоянно нажимать **Retry** в Cline.
+2. **Анализирует ошибки и автоматически меняет модель:**
+   - При `429` определяет тип лимита (`PerMinute` / `retryDelay` или дневной `PerDay` / `RPD`) и замораживает пару `(ключ, модель)` на нужное время.
+   - Если `KEYS_PER_MODEL` (по умолчанию 3) ключей подряд на модели дали `429`, **сама модель** автоматически ставится на паузу (`90с` при минутном лимите или `300с` при дневном RPD) — следующие запросы из Cline **мгновенно** идут сразу на рабочую модель, минуя проблемные. По истечении паузы скрипт сам проверит модель снова.
+   - При `500 / 502 / 503 / 504` (перегрузка в часы пик США) модель сразу уходит на паузу `90с`, а запрос уходит на следующую по списку.
+   - При `404` модель автоматически исключается из списка до перезапуска сервиса.
+3. **Защищает IP от бана:** делает анти-спам паузу (`0.5с`) между неудачными ключами и ограничивает число попыток на одну модель за круг.
 
 ---
 
@@ -39,12 +41,16 @@ mkdir -p ~/gemini-rotator && cd ~/gemini-rotator
 nano ~/gemini-rotator/keys.txt
 ```
 
-Вставьте ключи по одному на строку:
+Вставьте ключи по одному на строку (пустые строки и строки, начинающиеся с `#`, игнорируются):
+
 ```text
+# Лучше по 1 ключу из разных Google-аккаунтов/проектов
 AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXX1
 AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXX2
 AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXX3
 ```
+
+> **Важно:** если добавить 30–50 ключей из **одного** Google Cloud проекта, квота у них будет общая. Лучше держать по 1 ключу на каждый независимый Google-аккаунт/проект.
 
 Сохранение в `nano`: `Ctrl + O` → `Enter` → `Ctrl + X`.
 
@@ -52,12 +58,21 @@ AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXX3
 
 ```bash
 cat << 'EOF' > ~/gemini-rotator/rotator.py
-import http.server, urllib.request, urllib.error, itertools, re, time, threading, sys
+import http.server, urllib.request, urllib.error, re, time, threading, sys, os, json, random
 
 sys.stdout.reconfigure(line_buffering=True)
 
 PROXY = "http://100.64.0.101:8888"
-KEYS = [l.strip() for l in open("keys.txt") if l.strip()]
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KEYS = [
+    l.strip()
+    for l in open(os.path.join(BASE_DIR, "keys.txt"), encoding="utf-8")
+    if l.strip() and not l.strip().startswith("#")
+]
+
+if not KEYS:
+    raise SystemExit("Ошибка: файл keys.txt пуст!")
+
 MODELS = [
     "gemini-4-hydrogen",
     "gemini-3.8-flash",
@@ -66,26 +81,89 @@ MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
 ]
-MAX_WAIT = 120      # сколько секунд максимум пытаться достучаться до Google
-REQ_TIMEOUT = 15    # таймаут одной попытки (сек)
-RETRY_DELAY = 3     # базовая пауза между кругами (растёт 3с -> 6с -> 9с)
+
+MAX_WAIT = 120            # макс. время ожидания ответа (сек)
+REQ_TIMEOUT = 45          # таймаут одного запроса к Google (сек)
+RETRY_DELAY = 5           # пауза между кругами, если все модели заняты (сек)
+KEY_DELAY = 0.5           # анти-спам пауза при смене ключа после 429 (сек)
+KEYS_PER_MODEL = 3        # макс. попыток ключей на одну модель за круг
+
+MODEL_RPM_COOLDOWN = 90   # пауза модели, если подряд сработал RPM лимит (сек)
+MODEL_RPD_COOLDOWN = 300  # пауза модели, если подряд сработал дневной RPD (сек)
+MODEL_5XX_COOLDOWN = 90   # пауза модели при перегрузке 500/502/503/504 (сек)
 
 lock = threading.Lock()
-cycle = itertools.cycle(KEYS)
-cur = next(cycle)
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+key_idx = 0
+key_cooldowns = {}        # (key, model) -> timestamp
+model_cooldowns = {}      # model -> timestamp
+dead_models_global = set()
 
-def get_key():
-    with lock:
-        return cur
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
+)
 
-def next_key():
-    global cur
+def pick_key(model):
+    global key_idx
+    now = time.time()
     with lock:
-        cur = next(cycle)
-        return cur
+        n = len(KEYS)
+        for offset in range(n):
+            pos = (key_idx + offset) % n
+            k = KEYS[pos]
+            if key_cooldowns.get((k, model), 0) <= now:
+                key_idx = (pos + 1) % n
+                return k
+    return None
+
+def set_key_cooldown(key, model, seconds):
+    with lock:
+        key_cooldowns[(key, model)] = time.time() + seconds
+
+def set_model_cooldown(model, seconds):
+    if not model:
+        return
+    with lock:
+        model_cooldowns[model] = max(model_cooldowns.get(model, 0), time.time() + seconds)
+
+def get_ordered_models(req_m):
+    now = time.time()
+    with lock:
+        base = [req_m] + [x for x in MODELS if x != req_m] if req_m else [""]
+        candidates = [m for m in base if m not in dead_models_global]
+        ready = [m for m in candidates if model_cooldowns.get(m, 0) <= now]
+        paused = sorted(
+            [m for m in candidates if model_cooldowns.get(m, 0) > now],
+            key=lambda m: model_cooldowns[m],
+        )
+    return ready, paused
+
+def parse_429(err_bytes):
+    text = err_bytes.decode("utf-8", errors="ignore")
+    delay = 60
+    is_daily = False
+    reason = "rate limit"
+    try:
+        data = json.loads(text)
+        msg = data.get("error", {}).get("message", "")
+        if msg:
+            reason = msg.split(".")[0][:80]
+        for d in data.get("error", {}).get("details", []):
+            if "retryDelay" in d:
+                m = re.search(r'(\d+)', str(d["retryDelay"]))
+                if m:
+                    delay = max(10, int(m.group(1)))
+    except Exception:
+        pass
+    if "PerDay" in text or "daily" in text.lower():
+        delay = 1800  # дневная квота -> заморозка пары (ключ, модель) на 30 мин
+        is_daily = True
+        reason = "Daily quota (RPD)"
+    return delay, is_daily, reason
 
 class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
     def do_POST(self):
         start = time.time()
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -93,69 +171,94 @@ class H(http.server.BaseHTTPRequestHandler):
         m = re.search(r'/models/([^:]+)', clean_p)
         req_m = m.group(1) if m else ""
 
-        # Сначала модель из Cline, потом запасные из MODELS.
-        # Если хотите ВСЕГДА начинать с первой модели из MODELS (gemini-4-hydrogen)
-        # независимо от настроек Cline, замените строку ниже на:
-        # try_models = list(MODELS) if req_m else [""]
-        try_models = [req_m] + [x for x in MODELS if x != req_m] if req_m else [""]
-
         dom = "generativelanguage" + "." + "googleapis" + "." + "com"
         attempt = 0
 
-        while time.time() - start < MAX_WAIT and try_models:
+        while time.time() - start < MAX_WAIT:
             attempt += 1
-            dead_models = []
-            key = get_key()
+            ready_models, paused_models = get_ordered_models(req_m)
+            if not ready_models and not paused_models:
+                break
 
-            for model in list(try_models):
+            # Если есть активные модели — работаем с ними; если все на паузе — пробуем с наименьшей паузой
+            models_to_try = ready_models if ready_models else paused_models
+            if not ready_models:
+                print(f"[INFO] Все модели в паузе, пробую резервный обход...")
+
+            for model in models_to_try:
                 if time.time() - start >= MAX_WAIT:
                     break
-                path = re.sub(r'/models/[^:]+', f'/models/{model}', clean_p) if model else clean_p
 
-                for _ in range(len(KEYS)):
+                path = re.sub(r'/models/[^:]+', f'/models/{model}', clean_p) if model else clean_p
+                tries_for_model = min(KEYS_PER_MODEL, len(KEYS))
+                all_429 = True
+                all_daily = True
+                got_429 = False
+
+                for _ in range(tries_for_model):
                     if time.time() - start >= MAX_WAIT:
                         break
+
+                    key = pick_key(model)
+                    if not key:
+                        print(f"[SKIP] {model}: все ключи на паузе -> следующая модель")
+                        break
+
                     u = f"https://{dom}{path}{'&' if '?' in path else '?'}key={key}"
                     req = urllib.request.Request(u, data=body, method="POST")
                     req.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
                     req.add_header("x-goog-api-key", key)
+
                     try:
                         with opener.open(req, timeout=REQ_TIMEOUT) as r:
-                            print(f"[OK] {model} | ключ {key[:10]}... | круг #{attempt}")
-                            self.send_response(r.status)
-                            self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
-                            self.end_headers()
-                            self.wfile.write(r.read())
-                            return
+                            resp_data = r.read()
+                            ctype = r.headers.get("Content-Type", "application/json")
+                            status = r.status
+                        print(f"[OK] {model} | ключ {key[:10]}... | круг #{attempt}")
+                        self.send_response(status)
+                        self.send_header("Content-Type", ctype)
+                        self.end_headers()
+                        self.wfile.write(resp_data)
+                        return
                     except urllib.error.HTTPError as e:
                         err = e.read()
                         if e.code == 429:
-                            print(f"[429] {model} | ключ {key[:10]}... -> следующий ключ")
-                            key = next_key()
+                            got_429 = True
+                            cd, is_daily, reason = parse_429(err)
+                            all_daily = all_daily and is_daily
+                            set_key_cooldown(key, model, cd)
+                            print(f"[429] {model} | {key[:10]}... | пауза {cd}с ({reason})")
+                            time.sleep(KEY_DELAY + random.uniform(0.1, 0.3))
                             continue
+                        all_429 = False
                         if e.code in (500, 502, 503, 504):
-                            print(f"[{e.code}] {model} занята -> следующая модель")
+                            set_model_cooldown(model, MODEL_5XX_COOLDOWN)
+                            print(f"[{e.code}] {model} занята -> пауза модели {MODEL_5XX_COOLDOWN}с")
                             break
                         if e.code == 404:
-                            print(f"[404] {model} не найдена -> убираю из списка")
-                            dead_models.append(model)
+                            with lock:
+                                dead_models_global.add(model)
+                            print(f"[404] {model} не найдена -> отключена")
                             break
                         self.send_response(e.code)
                         self.end_headers()
                         self.wfile.write(err)
                         return
                     except Exception as e:
+                        all_429 = False
                         print(f"[ERR] {model}: {e} -> следующая модель")
                         break
-
-            for dm in dead_models:
-                if dm in try_models:
-                    try_models.remove(dm)
+                else:
+                    # Если все tries_for_model попыток на модели закончились 429 — ставим саму модель на паузу
+                    if got_429 and all_429 and model:
+                        m_cd = MODEL_RPD_COOLDOWN if all_daily else MODEL_RPM_COOLDOWN
+                        set_model_cooldown(model, m_cd)
+                        print(f"[MODEL PAUSE] {model} -> пауза {m_cd}с, дальше пойдём сразу на другие")
 
             left = MAX_WAIT - (time.time() - start)
-            if left > 0 and try_models:
+            if left > 0:
                 delay = min(RETRY_DELAY * min(attempt, 3), left)
-                print(f"[RETRY #{attempt}] Все модели/ключи заняты, жду {delay:.1f}с...")
+                print(f"[RETRY #{attempt}] Все модели заняты, жду {delay:.1f}с...")
                 time.sleep(delay)
 
         self.send_response(503)
@@ -167,12 +270,20 @@ http.server.ThreadingHTTPServer(("127.0.0.1", 4000), H).serve_forever()
 EOF
 ```
 
-### 2.3. Ручной запуск (для проверки)
+### 2.3. Ручной запуск и проверка ключа
 
-Запускать нужно из папки `~/gemini-rotator` (так как `keys.txt` открывается по относительному пути):
-
+Для ручного запуска:
 ```bash
 cd ~/gemini-rotator && python3 rotator.py
+```
+
+Для ручной проверки конкретного ключа через `curl` (подставьте реальный ключ из `keys.txt` латиницей):
+```bash
+KEY=$(head -n 1 ~/gemini-rotator/keys.txt)
+curl -s -x http://100.64.0.101:8888 \
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"parts":[{"text":"hi"}]}]}'
 ```
 
 ---
@@ -207,10 +318,10 @@ systemctl --user enable --now gemini-rotator.service
 # Статус сервиса
 systemctl --user status gemini-rotator.service
 
-# Логи в реальном времени (будет видно [OK], [429], [503], [RETRY])
+# Логи в реальном времени
 journalctl --user -u gemini-rotator.service -f
 
-# Перезапуск после правки rotator.py или keys.txt
+# Перезапуск после правки rotator.py или keys.txt (сбрасывает паузы моделей и 404)
 systemctl --user restart gemini-rotator.service
 ```
 
@@ -224,12 +335,12 @@ systemctl --user restart gemini-rotator.service
 * **Gemini API Key:** любое слово (например, `rotator` — скрипт сам подставит ключ из `keys.txt`)
 * **Use custom base URL:** включено (`✓`)
 * **Custom Base URL:** `http://127.0.0.1:4000`
-* **Model:** выберите нужную стартовую модель (например, `gemini-4-hydrogen` или `gemini-3.8-flash`).
-  > **Важно:** ротатор начинает с той модели, которая указана в Cline (если только вы не включили `try_models = list(MODELS)` в коде скрипта — тогда приоритет всегда задаётся списком `MODELS`).
+* **Model:** выберите желаемую стартовую модель (например, `gemini-4-hydrogen` или `gemini-3.5-flash`).
+  > Если стартовая модель упрётся в лимиты/перегрузку, ротатор сам временно отправит её на паузу и следующие запросы из Cline будет сразу направлять на рабочую модель из `MODELS`.
 
 ### 4.2. Настройки Proxy в VS Code
 * Если прокси `100.64.0.101:8888` нужен **только для Cline**, в самом VS Code прокси включать не нужно — `rotator.py` ходит через него сам.
-* Если в VS Code (`Ctrl + ,`) уже прописаны `Http: Proxy` = `http://100.64.0.101:8888` и `Http: Proxy Support` = `override`, обязательно добавьте `127.0.0.1` и `localhost` в `settings.json`, чтобы запросы к ротатору не уходили во внешний прокси:
+* Если в VS Code (`Ctrl + ,`) уже прописаны `Http: Proxy` = `http://100.64.0.101:8888` и `Http: Proxy Support` = `override`, обязательно добавьте локальные адреса в `settings.json`:
   ```json
   "http.noProxy": [
     "127.0.0.1",
@@ -240,8 +351,6 @@ systemctl --user restart gemini-rotator.service
 ---
 
 ## 5. Вариант для локальной сети (один ротатор на все ПК)
-
-Чтобы не держать `keys.txt` и скрипт на каждом компьютере:
 
 1. На главном ПК в последней строке `rotator.py` замените `"127.0.0.1"` на `"0.0.0.0"`:
    ```python
@@ -262,14 +371,27 @@ systemctl --user restart gemini-rotator.service
 4. На остальных ПК в настройках Cline укажите:
    * **Use custom base URL:** `http://<IP_ГЛАВНОГО_ПК>:4000`
    * **Gemini API Key:** `rotator`
-   * (Если в VS Code на клиентском ПК включён `http.proxy`, добавьте `<IP_ГЛАВНОГО_ПК>` в `http.noProxy`.)
+   * *(Если в VS Code на клиентском ПК включён `http.proxy`, добавьте `<IP_ГЛАВНОГО_ПК>` в `http.noProxy`.)*
 
 ---
 
-## 6. Тюнинг параметров в `rotator.py`
+## 6. Параметры и расшифровка логов
 
-* `MAX_WAIT = 120` — максимальное время ожидания ответа (в секундах). Если Free Tier перегружен дольше 2 минут, можно увеличить до `180` или `300`.
-* `REQ_TIMEOUT = 15` — сколько секунд ждать ответа от одной попытки, прежде чем перейти к следующей модели.
-* `RETRY_DELAY = 3` — базовая пауза между кругами (увеличивается на 2-м и 3-м круге: `3с → 6с → 9с`).
-* `MODELS` — порядок резервных моделей (сверху вниз).
-```
+### Основные параметры в `rotator.py`
+* `MODELS` — приоритет моделей сверху вниз.
+* `KEYS_PER_MODEL = 3` — сколько разных ключей пробовать на одной модели, прежде чем сменить модель (защита от спама).
+* `KEY_DELAY = 0.5` — пауза между ключами при `429`.
+* `MODEL_RPM_COOLDOWN = 90` — на сколько секунд пропускать модель при минутном лимите.
+* `MODEL_RPD_COOLDOWN = 300` — на сколько секунд пропускать модель при дневном лимите (`RPD`).
+* `MODEL_5XX_COOLDOWN = 90` — на сколько секунд пропускать модель при ошибке перегрузки `503`.
+* `REQ_TIMEOUT = 45` — таймаут ожидания ответа от Google (увеличен до 45с, чтобы длинные ответы Cline не обрывались).
+* `MAX_WAIT = 120` — общее максимальное время попыток на один запрос.
+
+### Что означают сообщения в `journalctl`
+* `[OK] ...` — запрос успешно выполнен.
+* `[429] ... | пауза Xс (...)` — ключ упёрся в лимит и заморожен для этой модели на `X` секунд.
+* `[MODEL PAUSE] ...` — на модели сработали лимиты на всех проверенных ключах подряд; следующие запросы будут сразу идти в обход неё.
+* `[503] ... занята` — серверы Google перегружены (часто в рабочие часы США), модель поставлена на паузу `90с`.
+* `[404] ... отключена` — модель не найдена по этому API-пути и отключена до перезапуска.
+* `[SKIP] ...` — все ключи для данной модели сейчас на паузе, мгновенный переход к следующей.
+* `[RETRY #N]` — все доступные модели заняты, ожидание перед следующим кругом.
